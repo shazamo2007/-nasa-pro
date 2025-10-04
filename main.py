@@ -1,40 +1,412 @@
-import asyncio
-import logging
-import time
-import webbrowser
-import threading
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
-from cachetools import TTLCache
-from requests.exceptions import RequestException, Timeout, HTTPError
-from fuzzywuzzy import process, fuzz
-from statistics import mean
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import requests
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from pydantic import BaseModel
+import math
+import os
 
 app = FastAPI(title="NASA Weather Advisor")
 
-# Configure CORS with restricted origins for security
+# السماح للفرونت إند بالاتصال
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-frontend.com"],
-    allow_methods=["GET", "POST"],
+    allow_origins=["*"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Cache for location and weather data
-location_cache = TTLCache(maxsize=1000, ttl=3600)
-weather_cache = TTLCache(maxsize=10000, ttl=3600)
+# خدمة الملفات الثابتة للفرونت إند
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+class WeatherRequest(BaseModel):
+    country: str
+    city: str
+    date: str
+    user_type: str
+    category: str
+
+class LocationService:
+    def get_coordinates(self, country: str, city: str) -> Dict:
+        try:
+            query = f"{city}, {country}"
+            url = "https://nominatim.openstreetmap.org/search"
+            params = {"q": query, "format": "json", "limit": 1}
+            
+            headers = {'User-Agent': 'WeatherApp/1.0'}
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    location = data[0]
+                    return {
+                        "success": True,
+                        "lat": float(location["lat"]),
+                        "lon": float(location["lon"]),
+                        "display_name": location.get("display_name", f"{city}, {country}")
+                    }
+            return {"success": False, "error": "Location not found"}
+        except Exception as e:
+            return {"success": False, "error": f"Geocoding error: {str(e)}"}
+
+class WeatherService:
+    def __init__(self):
+        self.nasa_url = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    
+    def get_weather_data(self, lat: float, lon: float, target_date: str) -> Dict:
+        try:
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+            current_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            if target_dt > current_date:
+                historical_year = target_dt.year - 1
+                start_date = f"{historical_year}{target_dt.strftime('%m%d')}"
+            else:
+                start_date = target_date.replace("-", "")
+            
+            end_date = start_date
+            
+            params = {
+                "parameters": "T2M,RH2M,WS2M,PRECTOT",
+                "start": start_date,
+                "end": end_date,
+                "latitude": lat,
+                "longitude": lon,
+                "community": "AG",
+                "format": "JSON"
+            }
+            
+            response = requests.get(self.nasa_url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                return self._process_weather_data(response.json(), target_date)
+            else:
+                return self._get_default_weather(lat)
+                
+        except Exception as e:
+            print(f"Weather API error: {e}")
+            return self._get_default_weather(lat)
+    
+    def _process_weather_data(self, data: Dict, target_date: str) -> Dict:
+        try:
+            target_date_nasa = target_date.replace("-", "")
+            
+            temp_data = data['properties']['parameter']['T2M']
+            rh_data = data['properties']['parameter']['RH2M']
+            wind_data = data['properties']['parameter']['WS2M']
+            rain_data = data['properties']['parameter']['PRECTOT']
+            
+            target_temp = temp_data.get(target_date_nasa, 20)
+            target_rh = rh_data.get(target_date_nasa, 50)
+            target_wind = wind_data.get(target_date_nasa, 3)
+            target_rain = rain_data.get(target_date_nasa, 0)
+            
+            # تحديد حالة الطقس للفرونت إند
+            weather_condition = self._get_weather_condition(target_temp, target_rain, target_rh)
+            
+            return {
+                "temperature": round(target_temp, 1),
+                "humidity": round(target_rh, 1),
+                "wind_speed": round(target_wind, 1),
+                "precipitation": round(target_rain, 1),
+                "weather_condition": weather_condition,
+                "success": True
+            }
+        except Exception as e:
+            print(f"Weather processing error: {e}")
+            return self._get_default_weather(0)
+    
+    def _get_weather_condition(self, temp: float, rain: float, humidity: float) -> str:
+        """تحديد حالة الطقس للفرونت إند"""
+        if rain > 10:
+            return "rainy"
+        elif rain > 0:
+            return "cloudy"
+        elif temp > 30:
+            return "sunny"
+        elif temp < 10:
+            return "snowy"
+        else:
+            return "partly_cloudy"
+    
+    def _get_default_weather(self, lat: float) -> Dict:
+        base_temp = 25 if abs(lat) < 30 else 15
+        return {
+            "temperature": base_temp,
+            "humidity": 60.0,
+            "wind_speed": 5.0,
+            "precipitation": 0.0,
+            "weather_condition": "partly_cloudy",
+            "success": False,
+            "note": "Using estimated weather data"
+        }
+
+class AdviceService:
+    def __init__(self):
+        self.advice_data = {
+            "farmer": {
+                "wheat": {
+                    "rain_high": [
+                        "Postpone irrigation today to avoid soil waterlogging",
+                        "Cover the crop if possible to prevent damage",
+                        "Check drainage channels to avoid water accumulation"
+                    ],
+                    "rain_low": [
+                        "Reduce irrigation today as natural rainfall will help",
+                        "Monitor soil moisture before adding extra water"
+                    ],
+                    "no_rain": [
+                        "Irrigate normally according to your usual schedule",
+                        "Check for early signs of water stress on leaves"
+                    ]
+                },
+                "rice": {
+                    "rain_high": [
+                        "Ensure irrigation canals are open to prevent flooding",
+                        "Check field boundaries around fields for leaks",
+                        "Delay additional irrigation"
+                    ],
+                    "rain_low": [
+                        "Light rain supports growth; reduce extra irrigation",
+                        "Monitor water depth carefully in the paddy field"
+                    ],
+                    "no_rain": [
+                        "Irrigate regularly to maintain 5-10 cm water depth",
+                        "Watch for cracks in soil - early sign of dryness"
+                    ]
+                },
+                "vegetables": {
+                    "rain_high": [
+                        "Cover crops with plastic sheets or greenhouse nets",
+                        "Harvest ripe vegetables early to avoid spoilage",
+                        "Improve drainage around rows"
+                    ],
+                    "rain_low": [
+                        "Skip irrigation today; rainfall is sufficient",
+                        "Remove excess weeds that trap moisture"
+                    ],
+                    "no_rain": [
+                        "Irrigate in the morning or evening to reduce evaporation",
+                        "Mulch soil to conserve water"
+                    ]
+                },
+                "corn": {
+                    "rain_high": [
+                        "Inspect roots after heavy rain for damage",
+                        "Support weak plants with soil mounding"
+                    ],
+                    "rain_low": [
+                        "Reduce watering; rainfall is helpful",
+                        "Check leaves for early fungal infections"
+                    ],
+                    "no_rain": [
+                        "Irrigate regularly, especially during flowering stage",
+                        "Apply fertilizer if leaves turn pale"
+                    ]
+                },
+                "cotton": {
+                    "rain_high": [
+                        "Avoid irrigation during rainfall",
+                        "Check for boll rot after heavy rain"
+                    ],
+                    "rain_low": [
+                        "Rainfall supports growth; no extra irrigation needed",
+                        "Monitor pest levels (aphids, whiteflies)"
+                    ],
+                    "no_rain": [
+                        "Irrigate as scheduled; cotton requires consistent moisture",
+                        "Inspect for leaf wilt in hot conditions"
+                    ]
+                }
+            },
+            "user": {
+                "low": {
+                    "rain_high": [
+                        "Use plastic bags to cover shoes",
+                        "Carry a small, inexpensive umbrella",
+                        "Avoid drying clothes outdoors"
+                    ],
+                    "rain_low": [
+                        "Wear a light jacket or hoodie",
+                        "Carry a small plastic bag for essentials"
+                    ],
+                    "no_rain": [
+                        "Wear regular clothes according to temperature",
+                        "Stay hydrated if it's hot"
+                    ]
+                },
+                "medium": {
+                    "rain_high": [
+                        "Wear a raincoat or water-resistant jacket",
+                        "Carry a sturdy umbrella",
+                        "Avoid slippery shoes; choose sneakers with grip"
+                    ],
+                    "rain_low": [
+                        "A light waterproof jacket is enough",
+                        "Keep a foldable umbrella in your bag"
+                    ],
+                    "no_rain": [
+                        "Dress comfortably based on temperature",
+                        "Plan outdoor activities freely"
+                    ]
+                },
+                "high": {
+                    "rain_high": [
+                        "Wear waterproof jacket and waterproof shoes",
+                        "Use anti-rain backpack cover",
+                        "Consider driving instead of walking"
+                    ],
+                    "rain_low": [
+                        "Stylish waterproof jacket recommended",
+                        "Leather waterproof shoes are suitable"
+                    ],
+                    "no_rain": [
+                        "Dress according to fashion and comfort",
+                        "Sunglasses and light wear for sunny weather"
+                    ]
+                }
+            }
+        }
+    
+    def get_advice(self, user_type: str, category: str, precipitation: float, temperature: float) -> Dict:
+        if precipitation == 0:
+            rain_category = "no_rain"
+        elif precipitation <= 10:
+            rain_category = "rain_low"
+        else:
+            rain_category = "rain_high"
+        
+        try:
+            advice_list = self.advice_data[user_type][category][rain_category].copy()
+            
+            # إضافة نصائح إضافية حسب درجة الحرارة
+            if temperature < 5:
+                advice_list.append("❄️ Extreme cold warning - take extra precautions")
+            elif temperature < 10:
+                advice_list.append("🥶 Cold weather - dress warmly")
+            elif temperature > 40:
+                advice_list.append("🔥 Extreme heat warning - stay hydrated")
+            elif temperature > 30:
+                advice_list.append("☀️ Hot weather - drink plenty of water")
+            
+            return {
+                "success": True,
+                "advice": advice_list,
+                "rain_category": rain_category
+            }
+        except KeyError:
+            return {
+                "success": False,
+                "advice": ["No specific advice available for these conditions"],
+                "rain_category": rain_category
+            }
+    
+    def get_categories(self, user_type: str) -> List[str]:
+        if user_type in self.advice_data:
+            return list(self.advice_data[user_type].keys())
+        return []
+
+# تهيئة الخدمات
+location_service = LocationService()
+weather_service = WeatherService()
+advice_service = AdviceService()
+
+# خدمة الفرونت إند
+@app.get("/")
+async def serve_frontend():
+    return FileResponse('static/index.html')
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "healthy", "service": "NASA Weather Advisor"}
+
+@app.get("/api/categories")
+def get_categories(user_type: str):
+    if user_type not in ["farmer", "user"]:
+        raise HTTPException(status_code=400, detail="User type must be 'farmer' or 'user'")
+    
+    categories = advice_service.get_categories(user_type)
+    return {
+        "success": True,
+        "user_type": user_type,
+        "categories": categories
+    }
+
+@app.post("/api/analyze-weather")
+def analyze_weather(request: WeatherRequest):
+    # التحقق من الحقول المطلوبة
+    if not all([request.country, request.city, request.date, request.user_type, request.category]):
+        raise HTTPException(status_code=400, detail="All fields are required")
+    
+    if request.user_type not in ["farmer", "user"]:
+        raise HTTPException(status_code=400, detail="User type must be 'farmer' or 'user'")
+    
+    # التحقق من صحة الفئة
+    available_categories = advice_service.get_categories(request.user_type)
+    if request.category not in available_categories:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid category for {request.user_type}. Available: {', '.join(available_categories)}"
+        )
+    
+    # التحقق من التاريخ
+    try:
+        target_date = datetime.strptime(request.date, "%Y-%m-%d")
+        if target_date < datetime(2020, 1, 1) or target_date > datetime(2030, 12, 31):
+            raise HTTPException(status_code=400, detail="Date must be between 2020 and 2030")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    # الحصول على الإحداثيات
+    coords = location_service.get_coordinates(request.country, request.city)
+    if not coords["success"]:
+        raise HTTPException(status_code=400, detail=f"Location not found: {request.city}, {request.country}")
+    
+    # الحصول على بيانات الطقس
+    weather_data = weather_service.get_weather_data(coords["lat"], coords["lon"], request.date)
+    
+    # الحصول على النصائح
+    advice_result = advice_service.get_advice(
+        request.user_type, 
+        request.category, 
+        weather_data["precipitation"],
+        weather_data["temperature"]
+    )
+    
+    # الرد المناسب للفرونت إند
+    return {
+        "success": True,
+        "location": {
+            "country": request.country,
+            "city": request.city,
+            "coordinates": {"lat": coords["lat"], "lon": coords["lon"]},
+            "display_name": coords.get("display_name", f"{request.city}, {request.country}")
+        },
+        "date": request.date,
+        "user_type": request.user_type,
+        "category": request.category,
+        "weather": weather_data,
+        "advice": advice_result
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    # إنشاء مجلد static إذا لم يكن موجوداً
+    if not os.path.exists("static"):
+        os.makedirs("static")
+        print("📁 Created static directory")
+    
+    print("🚀 NASA Weather Advisor Server Starting...")
+    print("📍 Frontend: http://localhost:8000")
+    print("📚 API Docs: http://localhost:8000/docs")
+    print("⏹️  Press Ctrl+C to stop the server")
+    
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")weather_cache = TTLCache(maxsize=10000, ttl=3600)
 
 class WeatherRequest(BaseModel):
     country: str
@@ -684,4 +1056,5 @@ if __name__ == "__main__":
     browser_thread.start()
 
     # Run the server
+
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
